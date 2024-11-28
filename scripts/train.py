@@ -1,44 +1,21 @@
-"""
-Train a u-net model on the ultrasound dataset.
-For experiment tracking:
-    - Save a copy of the configuration file and the trained model in the output folder
-    - Log training metrics to a file or console
-    - Log training metrics to Weights & Biases
-"""
-
-import matplotlib
-matplotlib.use("Agg")  # Use non-interactive backend to avoid error when running on server without GUI
-
-import argparse
-import logging
-import monai
-import random
-import traceback
-import torch
 import os
-import sys
-import json
+import random
+import glob
 import yaml
-import wandb
-import numpy as np
-import matplotlib.pyplot as plt
-from monai.transforms import Compose, RandFlipd, RandShiftIntensityd
-
-
 from tqdm import tqdm
-from time import perf_counter
+import wandb
+import torch
+import importlib
 from datetime import datetime
-from torch.optim import Adam, AdamW
-from torch.optim.lr_scheduler import StepLR, CosineAnnealingLR
-
-from monai.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from monai.data.utils import decollate_batch
-from monai import transforms
-from monai.transforms import (
-    Compose,
-    Activations,
-    AsDiscrete
-)
+from monai.data import DataLoader, CacheDataset
+from monai.transforms import Compose, AsDiscrete
+import logging
+from monai.networks.utils import one_hot
+from monai.inferers import sliding_window_inference
+import matplotlib.pyplot as plt
+
 from monai.metrics import (
     DiceMetric, 
     MeanIoU, 
@@ -46,550 +23,348 @@ from monai.metrics import (
     ConfusionMatrixMetric
 )
 
-from lr_scheduler import PolyLRScheduler, LinearWarmupWrapper
-from UltrasoundDataset import UltrasoundDataset
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
-from monai.transforms.compose import get_seed
+# Dynamically load the model based on config prefix
+def load_model_from_config(config):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model_class_path = list(config['net'].keys())[0]
+    model_kwargs = config['net'][model_class_path].get('kwargs', {})
 
-# Patch MONAI's get_seed function to ensure it never returns None
-def safe_get_seed():
-    seed = get_seed()
-    if seed is None:
-        seed = 42  # Default fallback seed
-    return seed
-
-# Apply the patch
-monai.transforms.compose.get_seed = safe_get_seed
-
-
-# Parse command line arguments
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--train-data-folder",type=str, default="C:/Users/gabridal/Documents/Spine_project/DataSplit_prep_201124/train")
-    parser.add_argument("--val-data-folder", type=str, default="C:/Users/gabridal/Documents/Spine_project/DataSplit_prep_201124/valid")
-    parser.add_argument("--output-dir", type=str, default="C:/Users/gabridal/Documents/Spine_project/DataSplit_prep_201124/runs")
-    parser.add_argument("--config-file", type=str, default="C:/Users/gabridal/Documents/slicer_extentions/aigt/UltrasoundSegmentation/train_AttUNet_DiceCE.yaml")
-    parser.add_argument("--num-sample-images", type=int, default=6)
-    parser.add_argument("--num-fps-test-images", type=int, default=100)
-    parser.add_argument("--save-torchscript", action="store_true")
-    parser.add_argument("--save-ckpt-freq", type=int, default=0)
-    parser.add_argument("--wandb-entity-name", type=str, default="dalbenziog")
-    parser.add_argument("--wandb-project-name", type=str, default="SpineProject")
-    parser.add_argument("--wandb-exp-name", type=str)
-    parser.add_argument("--log-level", type=str, default="INFO")
-    parser.add_argument("--save-log", action="store_true")
-    parser.add_argument("--resume-ckpt", type=str)
-    try:
-        return parser.parse_args()
-    except SystemExit as err:
-        traceback.print_exc()
-        sys.exit(err.code)
-
-# Define the function for selecting the first channel
-def select_first_channel(x):
-    return x[:, :, 0]  # Select the first channel (assuming grayscale stored as 3 channels)
-
-
-def main(args):
-    # Load config file
-    # If config file is not given, use default config
-    # If path is not specified, look for config file in the same folder as this script
-    if args.config_file is None:
-        args.config_file = os.path.join(os.path.dirname(__file__), "train_config.yaml")
+    if model_class_path.startswith("monai."):
+        model_module_path, model_class_name = model_class_path.rsplit(".", 1)
+    elif model_class_path.startswith("CustomModels."):
+        model_module_path, model_class_name = model_class_path.replace("CustomModels.", "").rsplit(".", 1)
     else:
-        if not os.path.isabs(args.config_file):
-            args.config_file = os.path.join(os.path.dirname(__file__), args.config_file)
-    with open(args.config_file, "r") as f:
+        model_module_path, model_class_name = model_class_path.rsplit(".", 1)
+
+    # Import the module and class dynamically
+    model_module = importlib.import_module(model_module_path)
+    model_class = getattr(model_module, model_class_name)
+    return model_class(**model_kwargs).to(device)
+
+ # Utility function to dynamically load a transformation class
+def load_transform(class_path, args, kwargs):
+    module_path, class_name = class_path.rsplit(".", 1)
+    module = importlib.import_module(module_path)
+    transform_class = getattr(module, class_name)
+    return transform_class(*args, **kwargs)
+
+def main():
+    # Load configuration
+    with open("C:/Users/gabridal/Documents/CT_kidney_segmentation/configs/config_template.yaml", "r") as f:
         config = yaml.safe_load(f)
-    
-    # Initialize Weights & Biases
+
+    # Ensure W&B API key is set and login if needed
     wandb.login()
+
+    # Generate timestamp for unique experiment naming
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    if args.wandb_exp_name is not None:
-        experiment_name = f"{args.wandb_exp_name}_{timestamp}"
-    else:
-        experiment_name = f"{config['model_name']}_{config['loss_function']}_{timestamp}"
+    experiment_name = f"{config['wandb']['experiment_name']}_{timestamp}"
+
+    # Initialize W&B run with settings from config
     run = wandb.init(
-        # Set the project where this run will be logged
-        project=args.wandb_project_name,
-        entity=args.wandb_entity_name,
+        project=config['wandb']['project_name'],
+        entity=config['wandb']['entity_name'],
         name=experiment_name
-        )
-    run.define_metric("dice", summary="max")
-    run.define_metric("sensitivity", summary="max")
+    )
 
-    # Log values of the config dictionary on Weights & Biases
+    # Define custom metrics to track
+    run.define_metric("train/loss", summary="min")
+    run.define_metric("val/dice_metric", summary="max")
+    run.define_metric("val/sensitivity", summary="max")
+
+    # Log the configuration dictionary to W&B for experiment tracking
     wandb.config.update(config)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Create directory for run output
-    run_dir = os.path.join(args.output_dir, experiment_name)
-    os.makedirs(run_dir, exist_ok=True)
+    # Dynamically load the model based on config prefix
+    model = load_model_from_config(config)
+    model.to(device)
 
-    # Remove loggers from other libraries
-    for handler in logging.root.handlers[:]:
-        logging.root.removeHandler(handler)
+    # Load loss function from config
+    loss_class_path, loss_params = next(iter(config['loss'].items()))
+    loss_args = loss_params.get("args", [])
+    loss_kwargs = loss_params.get("kwargs", {})
+
+    # Convert weight to a torch.Tensor if it exists
+    if 'weight' in loss_kwargs and isinstance(loss_kwargs['weight'], list):
+        loss_kwargs['weight'] = torch.tensor(loss_kwargs['weight'], dtype=torch.float32).to(device)
     
-    # Set up logging to console
-    log_formatter = logging.Formatter("%(asctime)s [%(levelname)-8s]  %(message)s")
-    root_logger = logging.getLogger()
-    root_logger.setLevel(args.log_level)
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(log_formatter)
-    root_logger.addHandler(console_handler)
-    # Log to file if specified
-    if args.save_log:
-        log_file = os.path.join(run_dir, "train.log")
-        file_handler = logging.FileHandler(log_file, mode="w")
-        file_handler.setFormatter(log_formatter)
-        root_logger.addHandler(file_handler)
-        logging.info(f"Logging to file {log_file}.")
-    
-    # Save copy of config file in run folder
-    config_copy_path = os.path.join(run_dir, "train_config.yaml")
-    with open(config_copy_path, "w") as f:
-        yaml.dump(config, f)
-        logging.info(f"Saved config file to {config_copy_path}.")
-    
-    # Create checkpoints folder if needed
-    if args.save_ckpt_freq > 0:
-        ckpt_dir = os.path.join(run_dir, "ckpts")
-        os.makedirs(ckpt_dir, exist_ok=True)
+    # Dynamically import and initialize the loss class
+    module_path, class_name = loss_class_path.rsplit(".", 1)
+    loss_module = importlib.import_module(module_path)
+    loss_class = getattr(loss_module, class_name)
+    loss_function = loss_class(*loss_args, **loss_kwargs)
 
-    # Set up device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logging.info(f"Using device {device}.")
+    # Prepare optimizer
+    learning_rate = config['train']['learning_rate']
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
-    # Set seeds globally for reproducibility
-    seed = config["seed"]
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    # Scheduler
+    scheduler = CosineAnnealingLR(optimizer, T_max=config['train']['max_epochs'], eta_min=1e-9)
 
-    # Create transforms
-    train_transform_list = []
-    val_transform_list = []
-
-    if config["transforms"]["general"]:
-        for tfm in config["transforms"]["general"]:
-            try:
-                if "params" in tfm:
-                    train_transform_list.append(getattr(transforms, tfm["name"])(**tfm["params"]))
-                    val_transform_list.append(getattr(transforms, tfm["name"])(**tfm["params"]))
-                else:
-                    train_transform_list.append(getattr(transforms, tfm["name"])(keys=["image", "label"]))
-                    val_transform_list.append(getattr(transforms, tfm["name"])(keys=["image", "label"]))
-            except KeyError as e:
-                logging.error(f"Error in applying transform {tfm['name']}: {e}")
-
-    if config["transforms"]["train"]:
-        for tfm in config["transforms"]["train"]:
-            try:
-                train_transform_list.append(getattr(transforms, tfm["name"])(**tfm["params"]))
-            except KeyError:
-                train_transform_list.append(getattr(transforms, tfm["name"])(keys=["image", "label"]))
-
-    # Assign the same seed to all transforms
-    for transform in train_transform_list:
-        if hasattr(transform, "set_random_state"):
-            transform.set_random_state(seed=seed)
-
-    for transform in val_transform_list:
-        if hasattr(transform, "set_random_state"):
-            transform.set_random_state(seed=seed)
-
-    # Debugging: Print random states
-    for transform in train_transform_list:
-        print(f"Train Transform: {transform}, Seed: {getattr(transform, '_seed', None)}")
-    for transform in val_transform_list:
-        print(f"Val Transform: {transform}, Seed: {getattr(transform, '_seed', None)}")
-
-    # Create Compose objects
-    train_transform = Compose(train_transform_list)
-    val_transform = Compose(val_transform_list)
-
-    # Debugging: Print Compose
-    print("Train Transforms:", train_transform)
-    print("Val Transforms:", val_transform)
-
-    # Create datasets
-    train_dataset = UltrasoundDataset(args.train_data_folder, transform=train_transform)
-    val_dataset = UltrasoundDataset(args.val_data_folder, transform=val_transform)
-              
-    # **Manually add transforms**
-    # Example 1: Adding RandFlipd
-    # train_transform_list.append(RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1))
-    # val_transform_list.append(RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1))
-
-    # Example 2: Adding RandShiftIntensityd (applied only to images)
-    # train_transform_list.append(RandShiftIntensityd(keys=["image"], offsets=0.1, prob=0.5))
-
-    # Create dataloaders using UltrasoundDataset
-    train_dataloader = DataLoader(
-        train_dataset, 
-        batch_size=config["batch_size"], 
-        shuffle=config["shuffle"], 
-        num_workers=2,
-        generator=g
-    )
-    val_dataloader = DataLoader(
-        val_dataset, 
-        batch_size=config["batch_size"], 
-        shuffle=False, 
-        num_workers=0,
-        generator=g
-    )
-
-    # Construct loss function
-    use_sigmoid = True if config["out_channels"] == 1 else False # if sigmoid==True then Ensure the output is thresholded between [0, 1] 
-    use_softmax = True if config["out_channels"] > 1 else False
-    ce_weight = torch.tensor(config["class_weights"], device=device) \
-                    if config["out_channels"] > 1 else None
-    if config["loss_function"].lower() == "dicefocal":
-        loss_function = monai.losses.DiceFocalLoss(
-            sigmoid=use_sigmoid,
-            softmax=use_softmax,
-            lambda_dice=(1.0 - config["lambda_ce"]),
-            lambda_focal=config["lambda_ce"]
-        )
-    elif config["loss_function"].lower() == "tversky":
-        loss_function = monai.losses.TverskyLoss(
-            sigmoid=use_sigmoid,
-            softmax=use_softmax,
-            alpha=0.3,
-            beta=0.7  # best values from original paper
-        )
-    else:  # default to dice + cross entropy
-        loss_function = monai.losses.DiceCELoss(
-            sigmoid=use_sigmoid,
-            softmax=use_softmax,
-            lambda_dice=(1.0 - config["lambda_ce"]), 
-            lambda_ce=config["lambda_ce"],
-            ce_weight=ce_weight
-        )
-
-    # Construct model
-    dropout_rate = config["dropout_rate"] if "dropout_rate" in config else 0.0
-    if config["model_name"].lower() == "attentionunet":
-        model = monai.networks.nets.AttentionUnet(
-            spatial_dims=2,
-            in_channels=config["in_channels"],
-            out_channels=config["out_channels"],
-            channels=(16, 32, 64, 128, 256),
-            strides=(2, 2, 2, 2),
-            dropout=dropout_rate
-        )
-    elif config["model_name"].lower() == "effnetunet":
-        model = monai.networks.nets.FlexibleUNet(
-            in_channels=config["in_channels"],
-            out_channels=config["out_channels"],
-            backbone="efficientnet-b4",
-            pretrained=True
-        )
-    elif config["model_name"].lower() == "unetplusplus":
-        model = monai.networks.nets.BasicUNetPlusPlus(
-            spatial_dims=2,
-            in_channels=config["in_channels"],
-            out_channels=config["out_channels"]
-        )
-    elif config["model_name"].lower() == "unetr":
-        model = monai.networks.nets.UNETR(
-            in_channels=config["in_channels"],
-            out_channels=config["out_channels"],
-            img_size=config["image_size"],
-            dropout_rate=dropout_rate,
-            spatial_dims=2
-        )
-    elif config["model_name"].lower() == "swinunetr":
-        model = monai.networks.nets.SwinUNETR(
-            img_size=config["image_size"],
-            in_channels=config["in_channels"],
-            out_channels=config["out_channels"],
-            spatial_dims=2
-        )
-    elif config["model_name"].lower() == "segresnet":
-        model = monai.networks.nets.SegResNet(
-            spatial_dims=2,
-            in_channels=config["in_channels"],
-            out_channels=config["out_channels"]
-        )
-    else:  # default to unet
-        model = monai.networks.nets.UNet(
-            spatial_dims=2,
-            in_channels=config["in_channels"],
-            out_channels=config["out_channels"],
-            channels=(16, 32, 64, 128, 256),
-            strides=(2, 2, 2, 2),
-            num_res_units=config["num_res_units"] if "num_res_units" in config else 2,
-            dropout=dropout_rate
-        )
-    
-    model = model.to(device=device)
-    # optimizer = Adam(model.parameters(), config["learning_rate"], weight_decay=config["weight_decay"])
-    optimizer = AdamW(model.parameters(), config["learning_rate"], weight_decay=config["weight_decay"])
-
-    # resume training
-    if args.resume_ckpt:
-        try:
-            state = torch.load(args.resume_ckpt)
-            model.load_state_dict(state["model"])
-            optimizer.load_state_dict(state["optimizer"])
-            start_epoch = state["epoch"] + 1
-            best_val_loss = state["val_loss"]
-            logging.info(f"Loaded model from {args.resume_ckpt}.")
-        except Exception as e:
-            logging.error(f"Failed to load model from {args.resume_ckpt}: {e}.")
-    else:
-        start_epoch = 0
-        best_val_loss = np.inf
-
-    # Set up learning rate scheduler
-    try:
-        learning_rate_decay_frequency = int(config["learning_rate_decay_frequency"])
-    except Exception:
-        learning_rate_decay_frequency = 100
-    try:
-        learning_rate_decay_factor = float(config["learning_rate_decay_factor"])
-    except Exception:
-        learning_rate_decay_factor = 1.0 # No decay
-    # logging.info(f"Learning rate decay frequency: {learning_rate_decay_frequency}")
-    # logging.info(f"Learning rate decay factor: {learning_rate_decay_factor}")
-    # scheduler = StepLR(optimizer, step_size=learning_rate_decay_frequency, gamma=learning_rate_decay_factor)
-    
-    # next two schedulers use minibatch as step, not epoch
-    # need to move scheduler.step() to inner loop
-    start_step = start_epoch * len(train_dataloader)
-    max_steps = len(train_dataloader) * config["num_epochs"]
-    # scheduler = PolyLRScheduler(optimizer, config["learning_rate"], max_steps, last_step=start_step - 1)
-
-    # cosine annealing with warmup
-    warmup_steps = config["warmup_steps"] if "warmup_steps" in config else 250
-    last_cosine_step = start_step - warmup_steps if start_step > warmup_steps else 0
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, 
-        max_steps - warmup_steps, 
-        last_epoch=last_cosine_step - 1
-    )
-    scheduler = LinearWarmupWrapper(
-        optimizer, 
-        lr_scheduler, 
-        config["learning_rate"], 
-        warmup_steps=warmup_steps, 
-        last_step=start_step - 1
-    )
-
-    # Metrics
-    include_background = True if config["out_channels"] == 1 else False
-    dice_metric = DiceMetric(include_background=include_background, reduction="mean")
-    iou_metric = MeanIoU(include_background=include_background, reduction="mean")
-    hd95_metric = HausdorffDistanceMetric(include_background=include_background, percentile=95.0, reduction="mean")
+    # Initialize metrics and post-processing
+    dice_metric = DiceMetric(include_background=False, reduction="mean")
+    dice_metric = DiceMetric(include_background=False, reduction="mean")
+    iou_metric = MeanIoU(include_background=False, reduction="mean")
+    hd95_metric = HausdorffDistanceMetric(include_background=True, percentile=95.0, reduction="mean")
     confusion_matrix_metric = ConfusionMatrixMetric(
-        include_background=include_background, 
+        include_background=False, 
         metric_name=["accuracy", "precision", "sensitivity", "specificity", "f1_score"],
         reduction="mean"
     )
+    post_pred = AsDiscrete(argmax=True, to_onehot=2)
+    # post_label = AsDiscrete(to_onehot=2)
 
-    if config["out_channels"] == 1:
-        post_pred = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
-    else:
-        post_pred = Compose([AsDiscrete(argmax=True, to_onehot=config["out_channels"])])
+    # Prepare data from configuration
+    # Create the data list by pairing image and label files
+    image_files = sorted(glob.glob(os.path.join(config['data']['image'], "*.nii")))  # Adjust extension if needed
+    label_files = sorted(glob.glob(os.path.join(config['data']['label'], "*.nii")))
 
-    # Train model
-    epochs = config["num_epochs"]
-    for epoch in range(start_epoch, epochs):
-        logging.info(f"Epoch {epoch + 1}/{epochs}")
+    assert len(image_files) == len(label_files), "Mismatch between number of images and labels."
+
+    # Prepare the dataset as a list of dictionaries
+    data = [{"image": img, "label": lbl} for img, lbl in zip(image_files, label_files)]
+    assert len(data) > 0, "Data list is empty. Check image and label paths."
+
+    from sklearn.model_selection import train_test_split
+
+    # Split the data with an 80% train / 20% validation ratio
+    train_files, val_files = train_test_split(data, test_size=0.2, random_state=42)
+
+    # Print the number of samples
+    print(f"Training samples: {len(train_files)}")
+    print(f"Validation samples: {len(val_files)}")
+
+
+    # Parse and apply transformations from config for training and validation
+    train_transforms = Compose([
+        load_transform(aug_class, aug_details.get('args', []), aug_details.get('kwargs', {}))
+        for aug in config['train']['augmentation']
+        for aug_class, aug_details in aug.items()
+    ])
+
+    val_transforms = Compose([
+        load_transform(aug_class, aug_details.get('args', []), aug_details.get('kwargs', {}))
+        for aug in config['valid']['augmentation']
+        for aug_class, aug_details in aug.items()
+    ])
+
+    # Initialize CacheDataset with training and validation data lists
+    train_ds = CacheDataset(
+        data=train_files, 
+        transform=train_transforms, 
+        cache_rate=config['data']['cache_rate'], 
+        num_workers=config['data']['num_workers']
+    )
+    val_ds = CacheDataset(
+        data=val_files, 
+        transform=val_transforms, 
+        cache_rate=0.8, 
+        num_workers=config['data']['num_workers']
+    )
+
+    # Create DataLoader for training and validation
+    train_loader = DataLoader(
+        train_ds, 
+        batch_size=config['train']['batch_size'], 
+        shuffle=True, 
+        num_workers=config['data']['num_workers']
+    )
+
+    val_loader = DataLoader(
+        val_ds, 
+        batch_size=config['train']['val_batch_size'], 
+        shuffle=False, 
+        num_workers=config['data']['num_workers']
+    )
+
+    # Training loop
+    best_metric = -1
+    
+    for epoch in range(config['train']['max_epochs']):
+        print(f"Epoch {epoch + 1}/{config['train']['max_epochs']}")
         model.train()
         epoch_loss = 0
         step = 0
-        for batch in tqdm(train_dataloader):
+        for batch_data in tqdm(train_loader):
             step += 1
-            inputs = batch["image"].to(device=device)
-            labels = batch["label"].to(device=device)
-            if config["out_channels"] > 1:
-                labels = monai.networks.one_hot(labels, num_classes=config["out_channels"])
+            inputs, labels = batch_data["image"].to(device), batch_data["label"].to(device)
+            optimizer.zero_grad()
             outputs = model(inputs)
-            if isinstance(outputs, list):  # for unet++ output
-                outputs = outputs[0]
             loss = loss_function(outputs, labels)
             loss.backward()
-            scheduler.step()
             optimizer.step()
-            optimizer.zero_grad()
             epoch_loss += loss.item()
+            wandb.log({"train/loss_step": loss.item()})
+        
+        # Average epoch loss and log
         epoch_loss /= step
-        logging.info(f"Training loss: {epoch_loss}")
+        wandb.log({"train/loss_epoch": epoch_loss})
 
-        # Validation step
-        model.eval()
-        val_loss = 0
-        val_step = 0
-        with torch.no_grad():
-            for val_batch in tqdm(val_dataloader):
-                val_step += 1
-                val_inputs = val_batch["image"].to(device=device)
-                val_labels = val_batch["label"].to(device=device)
-                print(f"Before one-hot encoding: {val_labels.shape}")
-                if config["out_channels"] > 1:
-                    val_labels = monai.networks.one_hot(val_labels, num_classes=config["out_channels"])
-                    print(f"After one-hot encoding: {val_labels.shape}")
-                val_outputs = model(val_inputs)
-                if isinstance(val_outputs, list):
-                    val_outputs = val_outputs[0]
-                loss = loss_function(val_outputs, val_labels)
-                val_loss += loss.item()
-                
-                # Post processing
-                val_outputs = [post_pred(i) for i in decollate_batch(val_outputs)]
-                val_labels = decollate_batch(val_labels)
-                
-                dice_metric(y_pred=val_outputs, y=val_labels)
-                iou_metric(y_pred=val_outputs, y=val_labels)
-                hd95_metric(y_pred=val_outputs, y=val_labels)
-                confusion_matrix_metric(y_pred=val_outputs, y=val_labels)
+        # Validation
+        if (epoch + 1) % config['train']['val_interval'] == 0:
+            model.eval()
+            val_loss = 0
+            val_step = 0
+            with torch.no_grad():
+                for val_data in tqdm(val_loader):
+                    val_step += 1
+                    val_inputs, val_labels = val_data["image"].to(device), val_data["label"].to(device)
 
-            val_loss /= val_step
-            dice = dice_metric.aggregate().item()
-            iou = iou_metric.aggregate().item()
-            hd95 = hd95_metric.aggregate().item()
-            cm = confusion_matrix_metric.aggregate()
+                    # # Sliding window inference for larger inputs
+                    raw_outputs = sliding_window_inference(val_inputs, 
+                                                           config['valid']['roi_size'], 
+                                                           config['valid']['sw_batch_size'], 
+                                                           model)
+                    
+                    print(f"Shape of val_outputs: {raw_outputs.shape}")
+                    print(f"Shape of val_labels: {val_labels.shape}")
 
-            # reset status for next validation round
-            dice_metric.reset()
-            iou_metric.reset()
-            hd95_metric.reset()
-            confusion_matrix_metric.reset()
+                    # Calculate loss
+                    val_loss += loss_function(raw_outputs, val_labels).item()
 
-            logging.info(
-                f"Validation results:\n"
-                f"\tLoss: {val_loss}\n"
-                f"\tDice: {dice}\n"
-                f"\tIoU: {iou}\n"
-                f"\t95% HD: {hd95}\n"
-                f"\tAccuracy: {(acc := cm[0].item())}\n"
-                f"\tPrecision: {(pre := cm[1].item())}\n"
-                f"\tSensitivity: {(sen := cm[2].item())}\n"
-                f"\tSpecificity: {(spe := cm[3].item())}\n"
-                f"\tF1 score: {(f1 := cm[4].item())}"
-            )
-        
-        # Log a random sample of test images along with their ground truth and predictions
-        random.seed(config["seed"])
-        sample = random.sample(range(len(val_dataset)), args.num_sample_images)
+                    # Post-process predictions and labels
+                    val_outputs = [post_pred(i) for i in decollate_batch(raw_outputs)]
+                    val_labels =  decollate_batch(val_labels)
 
-        inputs = torch.stack([val_dataset[i]["image"] for i in sample])
-        labels = torch.stack([val_dataset[i]["label"] for i in sample])
-        with torch.no_grad():
-            outputs = model(inputs.to(device=device))
-        if isinstance(outputs, list):
-            outputs = outputs[0]
-        if isinstance(labels, list):
-            labels = labels[0]
+                    # Convert val_outputs to class indices for Hausdorff Distance
+                    val_outputs_hd = torch.argmax(raw_outputs, dim=1, keepdim=True)  # Shape: [B, 1, D, H, W]
 
-        fig, axes = plt.subplots(args.num_sample_images, 3, figsize=(9, 3 * args.num_sample_images))
-        for i in range(args.num_sample_images):
-            axes[i, 0].imshow(inputs[i, 0, :, :], cmap="gray")
-            axes[i, 1].imshow(labels[i].squeeze(), cmap="gray")
-            if config["out_channels"] == 1:
-                im = axes[i, 2].imshow(torch.sigmoid(outputs[i]).squeeze().detach().cpu(), cmap="gray")
-            else:
-                im = axes[i, 2].imshow(torch.softmax(outputs[i], dim=0).detach().cpu()[1, :, :], cmap="gray", vmin=0, vmax=1)  # Show only first segmentation class.
+                    # Compute metrics
+                    dice_metric(y_pred=val_outputs, y=val_labels)
+                    iou_metric(y_pred=val_outputs, y=val_labels)
+                    hd95_metric(y_pred=val_outputs_hd, y=val_labels)
+                    confusion_matrix_metric(y_pred=val_outputs, y=val_labels)
+
+                # Aggregate metrics
+                val_loss /= val_step
+                dice = dice_metric.aggregate().item()
+                iou = iou_metric.aggregate().item()
+                hd95 = hd95_metric.aggregate().item()
+                cm = confusion_matrix_metric.aggregate()
+
+                # Log metrics
+                logging.info(
+                    f"Validation Results - Epoch {epoch + 1}:\n"
+                    f"\tLoss: {val_loss:.4f}\n"
+                    f"\tDice: {dice:.4f}\n"
+                    f"\tIoU: {iou:.4f}\n"
+                    f"\t95% HD: {hd95:.4f}\n"
+                    f"\tAccuracy: {(acc := cm[0].item()):.4f}\n"
+                    f"\tPrecision: {(pre := cm[1].item()):.4f}\n"
+                    f"\tSensitivity: {(sen := cm[2].item()):.4f}\n"
+                    f"\tSpecificity: {(spe := cm[3].item()):.4f}\n"
+                    f"\tF1 score: {(f1 := cm[4].item()):.4f}"
+                )
+
+                # Log metrics to Weights & Biases
+                wandb.log({
+                    "val/loss": val_loss,
+                    "val/dice": dice,
+                    "val/iou": iou,
+                    "val/95hd": hd95,
+                    "val/accuracy": acc,
+                    "val/precision": pre,
+                    "val/sensitivity": sen,
+                    "val/specificity": spe,
+                    "val/f1_score": f1,
+                })
             
-            # Create an additional axis for the colorbar
-            cax = fig.add_axes([axes[i, 2].get_position().x1 + 0.01,
-                                axes[i, 2].get_position().y0,
-                                0.02,
-                                axes[i, 2].get_position().height])
-            fig.colorbar(im, cax=cax)
-        
-        # Log current learning rate
-        for param_group in optimizer.param_groups:
-            current_lr = param_group["lr"]
-            logging.info(f"Current learning rate: {current_lr}")
+                # Reset metrics for the next epoch
+                dice_metric.reset()
+                iou_metric.reset()
+                hd95_metric.reset()
+                confusion_matrix_metric.reset()
+            
+            # Visualize valid samples
+            random.seed(config["train"]["seed"])  # Ensure reproducibility
+            sample_indices = random.sample(range(len(val_ds)), config["valid"]["num_sample_images"])
 
-        # Log metrics and examples together to maintain global step == epoch
-        try:
-            run.log({
-                "train_loss": epoch_loss, 
-                "val_loss": val_loss,
-                "dice": dice,
-                "iou": iou,
-                "95hd": hd95,
-                "accuracy": acc,
-                "precision": pre,
-                "sensitivity": sen,
-                "specificity": spe,
-                "f1_score": f1,
-                "lr": current_lr,
-                "examples": wandb.Image(fig)})
-        except FileNotFoundError:
-            logging.error("Failed to log examples to Weights & Biases. Temporary image file not found.")
-        finally:
+            
+            # Load random samples
+            inputs = torch.stack([val_ds[i]["image"] for i in sample_indices]).to(device)  # Shape: [B, C, D, H, W]
+            labels = torch.stack([val_ds[i]["label"] for i in sample_indices]).to(device)  # Shape: [B, 1, D, H, W]
+
+            # Perform inference
+            outputs = sliding_window_inference(
+                inputs,
+                config["valid"]["roi_size"],
+                config["valid"]["sw_batch_size"],
+                model,
+            )
+
+            # Post-process predictions (reduce channel dimension with argmax)
+            outputs = torch.argmax(outputs, dim=1, keepdim=True)  # Shape: [B, 1, D, H, W]
+            print(f"Shape of outputs after argmax: {outputs.shape}")  # Should be [1, 1, 160, 160, 160]
+
+
+            # Visualize results
+            num_samples = config["valid"]["num_sample_images"]
+            fig, axes = plt.subplots(num_samples, 3, figsize=(12, 4 * num_samples))
+
+            for i in range(num_samples):
+                slice_idx = inputs.shape[2] // 2  # Middle slice of the 3D volume
+                axes[i, 0].imshow(inputs[i, 0, slice_idx, :, :].cpu(), cmap="gray")  # Input
+                axes[i, 0].set_title("Input")
+                axes[i, 1].imshow(labels[i, 0, slice_idx, :, :].cpu(), cmap="gray")  # Ground Truth
+                axes[i, 1].set_title("Ground Truth")
+                axes[i, 2].imshow(outputs[i, 0, slice_idx, :, :].cpu(), cmap="gray")  # Prediction (foreground class)
+                axes[i, 2].set_title("Prediction")
+
+            # Remove axes for a cleaner look
+            for ax in axes.flatten():
+                ax.axis("off")
+
+            # Log the figure to W&B
+            try:
+                wandb.log({"validation_examples": wandb.Image(fig)})
+            except Exception as e:
+                logging.warning(f"Failed to log validation examples to W&B: {e}")
+
+            # Close the plot to free up memory
             plt.close(fig)
+
+            # Save the best model
+            if dice > best_metric:
+                best_metric = dice
+                os.makedirs(config['log']['save_dir'], exist_ok=True)
+                torch.save(model.state_dict(), os.path.join(config['log']['save_dir'], "best_metric_model.pth"))
+                logging.info("Saved new best metric model")
+
+            logging.info(f"Validation Results - Epoch {epoch + 1}: Loss={val_loss:.4f}, Dice={dice:.4f}, IoU={iou:.4f}, HD95={hd95:.4f}")
+
+
         
-        # Save model checkpoint (if not the last epoch)
-        if (args.save_ckpt_freq > 0 
-            and (epoch + 1) % args.save_ckpt_freq == 0
-            and (epoch + 1) < config["num_epochs"]):
-            ckpt_model_path = os.path.join(ckpt_dir, f"model_{epoch:03d}.pt")
-            torch.save(model.state_dict(), ckpt_model_path)
-            logging.info(f"Saved model checkpoint to {ckpt_model_path}.")
 
-        # Keep latest model as just model.pt, which can be used for inference or to resume training
-        model_path = os.path.join(run_dir, "model.pt")
-        state = {
-            "epoch": epoch,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "val_loss": val_loss
-        }
-        torch.save(state, model_path)
+        # # Visualize random validation examples
+        # random.seed(config['train']["seed"])
+        # sample_indices = random.sample(range(len(val_ds)), config['valid']['num_sample_images'])
 
-        # Save latest model as TorchScript
-        if args.save_torchscript:
-            model.eval()  # disable dropout and batchnorm
-            ts_model_path = os.path.join(run_dir, "model_traced.pt")
-            model = model.to("cpu")
-            example_input = torch.rand(1, config["in_channels"], config["image_size"], config["image_size"])
-            traced_script_module = torch.jit.trace(model, example_input)
-            d = {"shape": example_input.shape}
-            extra_files = {"config.json": json.dumps(d)}
-            traced_script_module.save(ts_model_path, _extra_files=extra_files)
-        
-        # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_model_path = os.path.join(run_dir, "model_best.pt")
-            torch.save(state, best_model_path)
+        # inputs = torch.stack([val_ds[i]["image"] for i in sample_indices])
+        # labels = torch.stack([val_ds[i]["label"] for i in sample_indices])
+        # with torch.no_grad():
+        #     outputs = sliding_window_inference(
+        #         inputs.to(device), 
+        #         config['valid']['roi_size'], 
+        #         config['valid']['sw_batch_size'], 
+        #         model
+        #     )
+        # print(f"Shape of outputs before decollation: {outputs.shape}")
 
-            if args.save_torchscript:
-                best_ts_model_path = os.path.join(run_dir, "model_traced_best.pt")
-                traced_script_module.save(best_ts_model_path, _extra_files=extra_files)
-        
-        model = model.to(device=device)  # return model to original device
+        # outputs = [post_pred(i) for i in decollate_batch(outputs)]
+        # fig, axes = plt.subplots(config['valid']['num_sample_images'], 3, figsize=(9, 3 * config['valid']['num_sample_images']))
+        # for i, idx in enumerate(sample_indices):
+        #     axes[i, 0].imshow(inputs[i, 0, :, :].cpu(), cmap="gray")
+        #     axes[i, 1].imshow(labels[i].squeeze().cpu(), cmap="gray")
+        #     axes[i, 2].imshow(outputs[i].squeeze().cpu(), cmap="gray", vmin=0, vmax=1)
 
-    # Test inference time (load images before loop to exclude from time measurement)
-    logging.info("Measuring inference time...")
-    num_test_images = args.num_fps_test_images
-    inputs = torch.stack([val_dataset[i]["image"] for i in range(num_test_images)])
-    model.to(device)
-    model.eval()
-    with torch.no_grad():
-        start = perf_counter()
-        for i in range(num_test_images):
-            model(inputs[i, :, :, :].unsqueeze(0).to(device=device))
-        end = perf_counter()
-    avg_inf_time = (end - start) / num_test_images
-    avg_inf_fps = 1 / avg_inf_time
-    logging.info(f"Average inference time per image: {avg_inf_time:.4f}s ({avg_inf_fps:.2f} FPS)")
-    run.log({
-        "avg_inference_time": avg_inf_time,
-        "avg_inference_fps": avg_inf_fps
-    })
+        # # Log visualization to Weights & Biases
+        # wandb.log({"val/examples": wandb.Image(fig)})
 
-    run.finish()
+        # plt.close(fig)       
 
-
+# Check for the main module
 if __name__ == "__main__":
-    args = parse_args()
-    main(args)
+    main()
