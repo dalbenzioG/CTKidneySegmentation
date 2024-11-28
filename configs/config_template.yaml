@@ -1,13 +1,13 @@
 wandb:
   log_gradients: true  # Log model gradients every few steps
-  entity_name: "your W&B username"
+  entity_name: "dalbenziog"
   project_name: "CT_Kidney_Segmentation"
   experiment_name: "Spleen_Segmentation_Exp1"
 
 data:
-  image: "./data/kits23/dataset/imagesTr/"
-  label: "'./data/kits23/dataset/labelsTr/"
-  root_dir: "'./data/kits23/dataset/'"
+  image: "C:/Users/gabridal/Documents/CT_kidney_segmentation/dataset/imagesTr"
+  label: "C:/Users/gabridal/Documents/CT_kidney_segmentation/dataset/labelsTr/"
+  root_dir: "C:/Users/gabridal/Documents/CT_kidney_segmentation/dataset/'"
   num_class: 2
   cache_rate: 1.0
   num_workers: 2
@@ -37,9 +37,10 @@ net:
 
 
 train:
+  seed: 42
   batch_size: 2
   val_batch_size: 1
-  max_epochs: 30
+  max_epochs: 40
   val_interval: 5
   lr_scheduler: "cosine_decay"
   learning_rate: 0.0001
@@ -56,27 +57,16 @@ train:
         args: []
         kwargs:
           keys: ["image"]
-          a_min: -57
-          a_max: 164
+          a_min: -100
+          a_max: 200
           b_min: 0.0
           b_max: 1.0
           clip: true
-    - monai.transforms.CropForegroundd:
-        args: []
-        kwargs:
-          keys: ["image", "label"]
-          source_key: "image"
     - monai.transforms.Orientationd:
         args: []
         kwargs:
           keys: ["image", "label"]
           axcodes: "RAS"
-    - monai.transforms.Spacingd:
-        args: []
-        kwargs:
-          keys: ["image", "label"]
-          pixdim: [1.5, 1.5, 2.0]
-          mode: ["bilinear", "nearest"]
     - monai.transforms.SpatialPadd: #ResizeWithPadOrCrop:
         args: [ ]
         kwargs:
@@ -94,6 +84,7 @@ train:
           spatial_size: [160,160,160]
           
 valid:
+  num_sample_images: 2
   roi_size: [160, 160, 160]  # Adjust dimensions as needed
   sw_batch_size: 4  
   augmentation:
@@ -109,26 +100,33 @@ valid:
         args: []
         kwargs:
           keys: ["image"]
-          a_min: -57
-          a_max: 164
+          a_min: -100
+          a_max: 200
           b_min: 0.0
           b_max: 1.0
           clip: true
-    - monai.transforms.CropForegroundd:
-        args: []
-        kwargs:
-          keys: ["image", "label"]
-          source_key: "image"
     - monai.transforms.Orientationd:
         args: []
         kwargs:
           keys: ["image", "label"]
           axcodes: "RAS"
-    - monai.transforms.Spacingd:
+    - monai.transforms.SpatialPadd: #ResizeWithPadOrCrop:
+        args: [ ]
+        kwargs:
+          keys: [ "image", "label" ]
+          spatial_size: [160,160,160]
+    - monai.transforms.ResizeD:
         args: []
         kwargs:
-          keys: ["image", "label"]
-          pixdim: [1.5, 1.5, 2.0]
-          mode: ["bilinear", "nearest"]
+          keys:
+          - image
+          - label
+          mode:
+          - trilinear
+          - nearest
+          spatial_size: [160,160,160]
+
+
+
 
 
